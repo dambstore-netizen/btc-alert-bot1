@@ -1,6 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║         BTC ALERT BOT v2 — Railway.app                   ║
+║         BTC ALERT BOT v3 — PythonAnywhere               ║
+║   100% Crypto.com API — sem Binance, sem bloqueios       ║
 ║   8 indicadores: BB, ATR, Volume, RSI, S/R,              ║
 ║                  Funding Rate, VWAP, EMA Cross           ║
 ╚══════════════════════════════════════════════════════════╝
@@ -21,7 +22,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 CHECK_INTERVAL  = 900   # 15 minutos
 ALERT_COOLDOWN  = 3600  # não repete o mesmo alerta em 1h
-MIN_SCORE       = 3     # score mínimo para alertar (agora em 8)
+MIN_SCORE       = 3     # score mínimo para alertar (em 8)
 
 # Parâmetros técnicos
 BB_PERIOD       = 20
@@ -33,18 +34,17 @@ VOL_SPIKE_X     = 2.0
 RSI_PERIOD      = 14
 EMA_FAST        = 9
 EMA_SLOW        = 21
-VWAP_DEV_PCT    = 2.0    # desvio do VWAP em % para sinal
-FUNDING_BULL    = -0.05  # funding negativo → sinal bullish
-FUNDING_BEAR    = 0.10   # funding positivo alto → sinal bearish
+VWAP_DEV_PCT    = 2.0
+FUNDING_BULL    = -0.005   # funding negativo → sinal bullish
+FUNDING_BEAR    = 0.010    # funding positivo alto → sinal bearish
 
 SR_LEVELS       = [70000, 72000, 74000, 76000, 78000, 80000, 82000, 85000, 90000, 95000, 100000]
 SR_TOLERANCE    = 0.015
 
-API_CRYPTO      = "https://api.crypto.com/exchange/v1"
-API_BINANCE     = "https://fapi.binance.com"         # funding rate (grátis)
-API_COINGLASS   = "https://open-api.coinglass.com/public/v2"  # open interest (grátis)
-INSTRUMENT      = "BTC_USD"
-SYMBOL_BINANCE  = "BTCUSDT"
+# Crypto.com API — spot e perpetual
+API_BASE        = "https://api.crypto.com/exchange/v1"
+INSTRUMENT_SPOT = "BTC_USD"
+INSTRUMENT_PERP = "BTCUSD-PERP"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,15 +55,18 @@ log = logging.getLogger("BTCBot")
 
 
 # ─────────────────────────────────────────────
-#  FETCH DE DADOS
+#  FETCH DE DADOS — tudo na Crypto.com
 # ─────────────────────────────────────────────
-def fetch_candles(timeframe="1h", limit=100):
-    url = f"{API_CRYPTO}/public/get-candlestick"
-    params = {"instrument_name": INSTRUMENT, "timeframe": timeframe, "count": limit}
+def fetch_candles(instrument=INSTRUMENT_SPOT, timeframe="1h", limit=100):
+    """Candlesticks spot ou perpetual."""
+    url = f"{API_BASE}/public/get-candlestick"
+    params = {"instrument_name": instrument, "timeframe": timeframe, "count": limit}
     try:
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json().get("result", {}).get("data", [])
+        if not data:
+            return None, None, None, None
         return (
             [float(c["c"]) for c in data],
             [float(c["h"]) for c in data],
@@ -71,35 +74,57 @@ def fetch_candles(timeframe="1h", limit=100):
             [float(c["v"]) for c in data],
         )
     except Exception as e:
-        log.error(f"Erro candles: {e}")
+        log.error(f"Erro candles ({instrument}): {e}")
         return None, None, None, None
 
 
+def fetch_mark_price():
+    """Mark price do perpetual — usado para calcular funding implícito."""
+    url = f"{API_BASE}/public/get-mark-price-history"
+    params = {"instrument_name": INSTRUMENT_PERP, "timeframe": "1h", "count": 2}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json().get("result", {}).get("data", [])
+        if data:
+            return float(data[-1].get("v", 0))
+        return None
+    except Exception as e:
+        log.warning(f"Mark price indisponível: {e}")
+        return None
+
+
 def fetch_funding_rate():
-    """Funding rate actual dos futuros perpétuos BTC (Binance)."""
+    """
+    Funding rate estimado: diferença % entre preço perpetual e spot.
+    Positivo = longs a pagar (bearish). Negativo = shorts a pagar (bullish).
+    """
     try:
-        url = f"{API_BINANCE}/fapi/v1/premiumIndex"
-        r = requests.get(url, params={"symbol": SYMBOL_BINANCE}, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        rate = float(data.get("lastFundingRate", 0)) * 100  # em percentagem
-        return rate
-    except Exception as e:
-        log.warning(f"Funding rate indisponível: {e}")
-        return None
+        # Spot
+        r_spot = requests.get(
+            f"{API_BASE}/public/get-candlestick",
+            params={"instrument_name": INSTRUMENT_SPOT, "timeframe": "1h", "count": 1},
+            timeout=10
+        )
+        spot_data = r_spot.json().get("result", {}).get("data", [])
+        spot_price = float(spot_data[-1]["c"]) if spot_data else None
 
+        # Perpetual
+        r_perp = requests.get(
+            f"{API_BASE}/public/get-candlestick",
+            params={"instrument_name": INSTRUMENT_PERP, "timeframe": "1h", "count": 1},
+            timeout=10
+        )
+        perp_data = r_perp.json().get("result", {}).get("data", [])
+        perp_price = float(perp_data[-1]["c"]) if perp_data else None
 
-def fetch_open_interest():
-    """Open Interest BTC em USD (Binance Futures)."""
-    try:
-        url = f"{API_BINANCE}/fapi/v1/openInterest"
-        r = requests.get(url, params={"symbol": SYMBOL_BINANCE}, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return float(data.get("openInterest", 0))
+        if spot_price and perp_price and spot_price > 0:
+            basis = (perp_price - spot_price) / spot_price * 100
+            return basis, spot_price, perp_price
+        return None, None, None
     except Exception as e:
-        log.warning(f"Open Interest indisponível: {e}")
-        return None
+        log.warning(f"Funding estimado indisponível: {e}")
+        return None, None, None
 
 
 # ─────────────────────────────────────────────
@@ -153,41 +178,35 @@ def calc_atr(highs, lows, closes, p=14):
     tr  = np.maximum(h[1:] - l[1:],
           np.maximum(abs(h[1:] - c[:-1]), abs(l[1:] - c[:-1])))
     atr = np.full(len(c), np.nan)
-    atr[p] = tr[:p].mean()
-    for i in range(p + 1, len(c)):
-        atr[i] = (atr[i - 1] * (p - 1) + tr[i - 1]) / p
+    if p < len(tr):
+        atr[p] = tr[:p].mean()
+        for i in range(p + 1, len(c)):
+            atr[i] = (atr[i - 1] * (p - 1) + tr[i - 1]) / p
     return atr
 
 
-def calc_vwap(highs, lows, closes, volumes):
-    """VWAP diário simples com os últimos 24 períodos (1h)."""
-    h = np.array(highs[-24:])
-    l = np.array(lows[-24:])
-    c = np.array(closes[-24:])
-    v = np.array(volumes[-24:])
+def calc_vwap(highs, lows, closes, volumes, periods=24):
+    h = np.array(highs[-periods:])
+    l = np.array(lows[-periods:])
+    c = np.array(closes[-periods:])
+    v = np.array(volumes[-periods:])
     typical = (h + l + c) / 3
-    vwap = np.sum(typical * v) / np.sum(v)
-    return vwap
+    return np.sum(typical * v) / np.sum(v)
 
 
 def calc_ema_cross(closes):
-    """Retorna sinal de cruzamento EMA rápida/lenta."""
     ema_fast = calc_ema(closes, EMA_FAST)
     ema_slow = calc_ema(closes, EMA_SLOW)
     prev_diff = ema_fast[-2] - ema_slow[-2]
     curr_diff = ema_fast[-1] - ema_slow[-1]
-    if prev_diff < 0 and curr_diff >= 0:
-        return "bullish", ema_fast[-1], ema_slow[-1]
-    if prev_diff > 0 and curr_diff <= 0:
-        return "bearish", ema_fast[-1], ema_slow[-1]
-    direction = "bullish" if curr_diff > 0 else "bearish"
+    if prev_diff < 0 and curr_diff >= 0: return "bullish", ema_fast[-1], ema_slow[-1]
+    if prev_diff > 0 and curr_diff <= 0: return "bearish", ema_fast[-1], ema_slow[-1]
     return None, ema_fast[-1], ema_slow[-1]
 
 
 def rsi_divergence(closes, rsis, lb=10):
     valid = [(c, r) for c, r in zip(closes[-lb:], rsis[-lb:]) if not np.isnan(r)]
-    if len(valid) < 4:
-        return None
+    if len(valid) < 4: return None
     p  = [v[0] for v in valid]
     rs = [v[1] for v in valid]
     if p[-1] > max(p[:-1]) and rs[-1] <= max(rs[:-1]): return "bearish"
@@ -206,48 +225,44 @@ def near_sr(price):
 #  ANÁLISE PRINCIPAL
 # ─────────────────────────────────────────────
 def analyse():
-    closes, highs, lows, vols = fetch_candles(limit=100)
+    closes, highs, lows, vols = fetch_candles(INSTRUMENT_SPOT, "1h", 100)
     if not closes or len(closes) < 30:
         return None
 
     # Indicadores base
-    _, bbw    = calc_bb(closes, BB_PERIOD, BB_MULT)
-    atr       = calc_atr(highs, lows, closes, ATR_PERIOD)
-    atr_m     = sma(np.nan_to_num(atr), 20)
-    vol_m     = sma(vols, VOL_SMA)
-    rsi       = calc_rsi(closes, RSI_PERIOD)
+    _, bbw  = calc_bb(closes, BB_PERIOD, BB_MULT)
+    atr     = calc_atr(highs, lows, closes, ATR_PERIOD)
+    atr_m   = sma(np.nan_to_num(atr), 20)
+    vol_m   = sma(vols, VOL_SMA)
+    rsi     = calc_rsi(closes, RSI_PERIOD)
 
     # Novos indicadores
-    vwap           = calc_vwap(highs, lows, closes, vols)
-    ema_cross, ema_fast_val, ema_slow_val = calc_ema_cross(closes)
-    funding_rate   = fetch_funding_rate()
-    open_interest  = fetch_open_interest()
+    vwap                    = calc_vwap(highs, lows, closes, vols)
+    ema_cross, ema_f, ema_s = calc_ema_cross(closes)
+    basis, spot_p, perp_p   = fetch_funding_rate()
 
-    price          = closes[-1]
-    vwap_dev       = (price - vwap) / vwap * 100  # % de desvio do VWAP
+    price    = closes[-1]
+    vwap_dev = (price - vwap) / vwap * 100
 
-    # ── Sinais (8 no total) ──
-    sig_sq    = not np.isnan(bbw[-1])  and bbw[-1]  < BB_SQUEEZE_PCT
-    sig_atr   = not np.isnan(atr[-1])  and not np.isnan(atr_m[-1]) and atr[-1] > atr_m[-1]
-    sig_vol   = not np.isnan(vol_m[-1]) and vols[-1] > vol_m[-1] * VOL_SPIKE_X
-    sig_div   = rsi_divergence(closes, rsi)
+    # ── 8 Sinais ──
+    sig_sq   = not np.isnan(bbw[-1])   and bbw[-1]  < BB_SQUEEZE_PCT
+    sig_atr  = not np.isnan(atr[-1])   and not np.isnan(atr_m[-1]) and atr[-1] > atr_m[-1]
+    sig_vol  = not np.isnan(vol_m[-1]) and vols[-1] > vol_m[-1] * VOL_SPIKE_X
+    sig_div  = rsi_divergence(closes, rsi)
     sig_sr, sr_lvl = near_sr(price)
 
-    # Funding Rate: extremos sinalizam reversão
+    # Funding: basis (perp - spot) extremo
     sig_funding = False
     funding_dir = None
-    if funding_rate is not None:
-        if funding_rate >= FUNDING_BEAR:
-            sig_funding = True; funding_dir = "bearish"
-        elif funding_rate <= FUNDING_BULL:
-            sig_funding = True; funding_dir = "bullish"
+    if basis is not None:
+        if basis >= FUNDING_BEAR:
+            sig_funding = True; funding_dir = "bearish (longs sobrecarregados)"
+        elif basis <= FUNDING_BULL:
+            sig_funding = True; funding_dir = "bullish (shorts a ser espremidos)"
 
-    # VWAP: preço muito afastado do VWAP
     sig_vwap = abs(vwap_dev) >= VWAP_DEV_PCT
     vwap_dir = "acima" if vwap_dev > 0 else "abaixo"
-
-    # EMA Cross: cruzamento recente
-    sig_ema = ema_cross is not None
+    sig_ema  = ema_cross is not None
 
     score = sum([sig_sq, sig_atr, sig_vol, sig_div is not None,
                  sig_sr, sig_funding, sig_vwap, sig_ema])
@@ -256,9 +271,8 @@ def analyse():
         price=price, bbw=bbw[-1], atr=atr[-1], atr_m=atr_m[-1],
         vol=vols[-1], vol_m=vol_m[-1], rsi=rsi[-1],
         vwap=vwap, vwap_dev=vwap_dev, vwap_dir=vwap_dir,
-        ema_fast=ema_fast_val, ema_slow=ema_slow_val,
-        ema_cross=ema_cross, open_interest=open_interest,
-        funding_rate=funding_rate, funding_dir=funding_dir,
+        ema_fast=ema_f, ema_slow=ema_s, ema_cross=ema_cross,
+        basis=basis, spot_p=spot_p, perp_p=perp_p, funding_dir=funding_dir,
         sig_sq=sig_sq, sig_atr=sig_atr, sig_vol=sig_vol,
         sig_div=sig_div, sig_sr=sig_sr, sr_lvl=sr_lvl,
         sig_funding=sig_funding, sig_vwap=sig_vwap, sig_ema=sig_ema,
@@ -291,15 +305,12 @@ def build_msg(d):
     icon  = "🔴" if score >= 6 else "🟠" if score >= 3 else "🟢"
     lvl   = "ALTO" if score >= 6 else "MÉDIO" if score >= 3 else "BAIXO"
 
-    # Linhas de cada indicador
     def line(sig, label): return f"{'✅' if sig else '⬜'} {label}"
 
-    funding_txt = f"Funding: {d['funding_rate']:.3f}% ({d['funding_dir']})" if d['funding_rate'] is not None else "Funding: N/A"
-    vwap_txt    = f"VWAP: {d['vwap_dev']:+.1f}% {d['vwap_dir']} (${d['vwap']:,.0f})"
-    ema_txt     = f"EMA Cross: {d['ema_cross'] or 'sem cruzamento'}  (fast ${d['ema_fast']:,.0f} / slow ${d['ema_slow']:,.0f})"
-    sr_txt      = f"Zona S/R: ${d['sr_lvl']:,}" if d['sig_sr'] else "Zona S/R: longe"
-    oi_txt      = f"Open Interest: {d['open_interest']:,.0f} BTC" if d['open_interest'] else ""
-
+    basis_txt = (
+        f"Basis perp/spot: {d['basis']:+.3f}% ({d['funding_dir']})"
+        if d['basis'] is not None else "Basis perp/spot: N/A"
+    )
     interp = (
         "⚠️ ALERTA MÁXIMO — múltiplos sinais. Movimento ≥10% muito provável. Fecha posições ou define stops apertados."
         if score >= 6
@@ -308,39 +319,40 @@ def build_msg(d):
         else "✅ Mercado calmo. Boa altura para planear entradas."
     )
 
-    lines = [
-        f"<b>⚡ BTC ALERT v2 — {icon} {lvl}  ({score}/8)</b>",
+    return "\n".join([
+        f"<b>⚡ BTC ALERT v3 — {icon} {lvl}  ({score}/8)</b>",
         f"💰 <b>Preço:</b> ${d['price']:,.0f}   🕐 {d['ts']}",
         "",
         "<b>── Indicadores ──</b>",
-        line(d['sig_sq'],       f"BB Squeeze      (BB Width: {d['bbw']:.2f}%)"),
-        line(d['sig_atr'],      f"ATR elevado     (${d['atr']:.0f} vs média ${d['atr_m']:.0f})"),
-        line(d['sig_vol'],      f"Volume spike    ({d['vol']:.0f} vs média {d['vol_m']:.0f})"),
-        line(d['sig_div'],      f"RSI divergência {d['sig_div'] or '—'}  (RSI: {d['rsi']:.1f})"),
-        line(d['sig_sr'],       sr_txt),
-        line(d['sig_funding'],  funding_txt),
-        line(d['sig_vwap'],     vwap_txt),
-        line(d['sig_ema'],      ema_txt),
-    ]
-    if oi_txt:
-        lines.append(f"📊 {oi_txt}")
-    lines += ["", interp, "", "⚠️ Não é conselho financeiro. Gere sempre o risco."]
-    return "\n".join(lines)
+        line(d['sig_sq'],      f"BB Squeeze      (BB Width: {d['bbw']:.2f}%)"),
+        line(d['sig_atr'],     f"ATR elevado     (${d['atr']:.0f} vs média ${d['atr_m']:.0f})"),
+        line(d['sig_vol'],     f"Volume spike    ({d['vol']:.0f} vs média {d['vol_m']:.0f})"),
+        line(d['sig_div'],     f"RSI divergência {d['sig_div'] or '—'}  (RSI: {d['rsi']:.1f})"),
+        line(d['sig_sr'],      f"Zona S/R        (nível: ${d['sr_lvl']:,})" if d['sig_sr'] else "Zona S/R        (longe)"),
+        line(d['sig_funding'], basis_txt),
+        line(d['sig_vwap'],    f"VWAP desvio     {d['vwap_dev']:+.1f}% {d['vwap_dir']} (${d['vwap']:,.0f})"),
+        line(d['sig_ema'],     f"EMA Cross       {d['ema_cross'] or 'sem cruzamento'} (fast ${d['ema_fast']:,.0f} / slow ${d['ema_slow']:,.0f})"),
+        "",
+        interp,
+        "",
+        "⚠️ Não é conselho financeiro. Gere sempre o risco.",
+    ])
 
 
 # ─────────────────────────────────────────────
 #  LOOP PRINCIPAL
 # ─────────────────────────────────────────────
 def main():
-    log.info("BTC Alert Bot v2 iniciado.")
+    log.info("BTC Alert Bot v3 iniciado.")
     if not TELEGRAM_TOKEN:
         log.error("TELEGRAM_TOKEN não definido! Define a variável e reinicia.")
         return
 
     send_telegram(
-        f"🤖 <b>BTC Alert Bot v2 online!</b>\n"
-        f"8 indicadores activos: BB, ATR, Volume, RSI, S/R, Funding Rate, VWAP, EMA Cross.\n"
-        f"Alertas quando score ≥ {MIN_SCORE}/8 — a cada {CHECK_INTERVAL // 60} minutos."
+        f"🤖 <b>BTC Alert Bot v3 online!</b>\n"
+        f"8 indicadores — 100% Crypto.com API (sem bloqueios).\n"
+        f"BB Squeeze · ATR · Volume · RSI · S/R · Basis Perp/Spot · VWAP · EMA Cross\n"
+        f"Alertas quando score ≥ {MIN_SCORE}/8 — de {CHECK_INTERVAL // 60} em {CHECK_INTERVAL // 60} minutos."
     )
 
     last_score = 0
@@ -359,7 +371,8 @@ def main():
             log.info(
                 f"Preço: ${d['price']:,.0f} | Score: {d['score']}/8 | "
                 f"BBW: {d['bbw']:.2f}% | RSI: {d['rsi']:.1f} | "
-                f"Funding: {d['funding_rate']:.3f}%" if d['funding_rate'] else
+                f"VWAP dev: {d['vwap_dev']:+.1f}% | "
+                f"Basis: {d['basis']:+.3f}%" if d['basis'] else
                 f"Preço: ${d['price']:,.0f} | Score: {d['score']}/8"
             )
 
